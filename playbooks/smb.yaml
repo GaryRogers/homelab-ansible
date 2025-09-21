@@ -20,7 +20,7 @@
     smb_server_string: "HomeLab SMB Server"
     smb_shared_directory: "/opt/shared"
     smb_share_name: "shared"
-    smb_valid_users: "{{ ansible_user }},@users"  # Allow ansible user and users group
+    smb_valid_users: "{{ ansible_user | default('ubuntu') }},@users"  # Allow ansible user and users group
     smb_create_mask: "0664"
     smb_directory_mask: "0775"
     smb_guest_ok: false
