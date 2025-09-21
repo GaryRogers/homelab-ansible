@@ -20,6 +20,8 @@
     smb_server_string: "HomeLab SMB Server"
     smb_shared_directory: "/opt/shared"
     smb_share_name: "shared"
+    smb_media_directory: "/opt/media"
+    smb_media_share_name: "media"
     smb_valid_users: "{{ ansible_user | default('ubuntu') }},@users"  # Allow ansible user and users group
     smb_create_mask: "0664"
     smb_directory_mask: "0775"
@@ -58,6 +60,17 @@
     - name: Create shared directory
       file:
         path: "{{ smb_shared_directory }}"
+        state: directory
+        owner: root
+        group: users
+        mode: '0775'
+      tags:
+        - smb
+        - directories
+
+    - name: Create media directory
+      file:
+        path: "{{ smb_media_directory }}"
         state: directory
         owner: root
         group: users
@@ -139,6 +152,37 @@
           [{{ smb_share_name }}]
              comment = HomeLab Shared Directory
              path = {{ smb_shared_directory }}
+             browseable = {{ smb_browseable | lower }}
+             writable = {{ smb_writable | lower }}
+             guest ok = {{ smb_guest_ok | lower }}
+             valid users = {{ smb_valid_users }}
+             create mask = {{ smb_create_mask }}
+             directory mask = {{ smb_directory_mask }}
+             force group = users
+             force create mode = 0664
+             force directory mode = 0775
+             
+             # macOS compatibility
+             vfs objects = catia fruit streams_xattr
+             fruit:metadata = stream
+             fruit:model = MacSamba
+             fruit:posix_rename = yes
+             fruit:veto_appledouble = no
+             fruit:wipe_intentionally_left_blank_rfork = yes
+             fruit:delete_empty_adfiles = yes
+      notify: restart samba
+      tags:
+        - smb
+        - configuration
+
+    - name: Configure media directory in Samba
+      blockinfile:
+        path: /etc/samba/smb.conf
+        marker: "# {mark} HOMELAB MEDIA DIRECTORY"
+        block: |
+          [{{ smb_media_share_name }}]
+             comment = HomeLab Media Directory
+             path = {{ smb_media_directory }}
              browseable = {{ smb_browseable | lower }}
              writable = {{ smb_writable | lower }}
              guest ok = {{ smb_guest_ok | lower }}
@@ -284,6 +328,8 @@
           # - Server String: {{ smb_server_string }}
           # - Shared Directory: {{ smb_shared_directory }}
           # - Share Name: {{ smb_share_name }}
+          # - Media Directory: {{ smb_media_directory }}
+          # - Media Share Name: {{ smb_media_share_name }}
           # - Valid Users: {{ smb_valid_users }}
           # 
           # Services Status:
@@ -298,10 +344,14 @@
           # Usage Instructions:
           # 1. Add local users to SMB: sudo smbpasswd -a <username>
           # 2. Add users to users group: sudo usermod -a -G users <username>
-          # 3. Access from Windows: \\{{ ansible_default_ipv4.address }}\{{ smb_share_name }}
-          # 4. Access from Linux: smb://{{ ansible_default_ipv4.address }}/{{ smb_share_name }}
-          # 5. Access from macOS: smb://{{ ansible_default_ipv4.address }}/{{ smb_share_name }}
-          # 6. Mount command: sudo mount -t cifs //{{ ansible_default_ipv4.address }}/{{ smb_share_name }} /mnt/point -o username=<user>
+          # 3. Access shared from Windows: \\{{ ansible_default_ipv4.address }}\{{ smb_share_name }}
+          # 4. Access shared from Linux: smb://{{ ansible_default_ipv4.address }}/{{ smb_share_name }}
+          # 5. Access shared from macOS: smb://{{ ansible_default_ipv4.address }}/{{ smb_share_name }}
+          # 6. Access media from Windows: \\{{ ansible_default_ipv4.address }}\{{ smb_media_share_name }}
+          # 7. Access media from Linux: smb://{{ ansible_default_ipv4.address }}/{{ smb_media_share_name }}
+          # 8. Access media from macOS: smb://{{ ansible_default_ipv4.address }}/{{ smb_media_share_name }}
+          # 9. Mount shared: sudo mount -t cifs //{{ ansible_default_ipv4.address }}/{{ smb_share_name }} /mnt/point -o username=<user>
+          # 10. Mount media: sudo mount -t cifs //{{ ansible_default_ipv4.address }}/{{ smb_media_share_name }} /mnt/point -o username=<user>
           #
           # Troubleshooting:
           # - Check SMB users: sudo pdbedit -L
@@ -326,13 +376,16 @@
           - "  ✓ Samba server installed and configured"
           - "  ✓ Shared directory: {{ smb_shared_directory }}"
           - "  ✓ SMB share: {{ smb_share_name }}"
+          - "  ✓ Media directory: {{ smb_media_directory }}"
+          - "  ✓ SMB media share: {{ smb_media_share_name }}"
           - "  ✓ Firewall rules added (ports 139, 445)"
           - "  ✓ Services enabled: smbd, nmbd"
           - ""
           - "Next Steps:"
           - "  1. Add users to SMB: sudo smbpasswd -a <username>"
           - "  2. Add users to group: sudo usermod -a -G users <username>"
-          - "  3. Access share: smb://{{ ansible_default_ipv4.address }}/{{ smb_share_name }}"
+          - "  3. Access shared: smb://{{ ansible_default_ipv4.address }}/{{ smb_share_name }}"
+          - "  4. Access media: smb://{{ ansible_default_ipv4.address }}/{{ smb_media_share_name }}"
           - ""
           - "For user 'grogers' specifically:"
           - "  sudo smbpasswd -a grogers"
