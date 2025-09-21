@@ -1,0 +1,465 @@
+---
+#===============================================================================
+# Nginx Reverse Proxy with Wake-on-LAN Playbook
+#===============================================================================
+# Description: Configures nginx as a reverse proxy for Ollama API with automatic
+#              wake-on-LAN functionality for the GamingPC
+# Author: HomeLab
+# Version: 1.0
+# Usage: ansible-playbook -i inventory/inventory.yaml playbooks/nginx-ollama-proxy.yaml
+#===============================================================================
+
+- name: Configure Nginx Reverse Proxy with WoL for Ollama
+  hosts: local
+  become: true
+  gather_facts: true
+  
+  vars:
+    # Nginx and proxy configuration
+    nginx_user: "www-data"
+    nginx_worker_processes: "auto"
+    nginx_worker_connections: 1024
+    
+    # GamingPC configuration (update these to match your setup)
+    gaming_pc_ip: "192.168.4.56"  # Update this to your GamingPC IP
+    gaming_pc_mac: "D8:5E:D3:0C:CF:5C"  # Update this to your GamingPC MAC address
+    gaming_pc_hostname: "gamingpc"
+    ollama_port: 11434
+    
+    # Proxy configuration
+    proxy_listen_port: 11434
+    proxy_timeout: 30
+    wake_timeout: 60  # How long to wait for PC to wake up
+    health_check_interval: 5  # Seconds between health checks
+    
+  pre_tasks:
+    - name: Display nginx proxy configuration information
+      debug:
+        msg:
+          - "=========================================="
+          - "Nginx Ollama Proxy with Wake-on-LAN"
+          - "=========================================="
+          - "Target Host: {{ inventory_hostname }}"
+          - "GamingPC IP: {{ gaming_pc_ip }}"
+          - "GamingPC MAC: {{ gaming_pc_mac }}"
+          - "Ollama Port: {{ ollama_port }}"
+          - "Proxy Listen Port: {{ proxy_listen_port }}"
+          - "Timestamp: {{ ansible_date_time.iso8601 }}"
+          - "=========================================="
+      tags: always
+
+  tasks:
+    - name: Install nginx and required packages
+      package:
+        name:
+          - nginx
+          - libnginx-mod-http-lua  # For Lua scripting support
+          - lua5.1
+          - liblua5.1-dev
+          - wakeonlan  # For WoL functionality
+          - netcat-openbsd  # For port checking
+        state: present
+      tags:
+        - nginx
+        - packages
+
+    - name: Enable nginx Lua module
+      file:
+        src: /usr/share/nginx/modules-available/mod-http-lua.conf
+        dest: /etc/nginx/modules-enabled/50-mod-http-lua.conf
+        state: link
+      notify: restart nginx
+      tags:
+        - nginx
+        - modules
+
+    - name: Create nginx lua scripts directory
+      file:
+        path: /etc/nginx/lua
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags:
+        - nginx
+        - directories
+
+    - name: Create wake-on-LAN Lua script
+      copy:
+        content: |
+          local function send_wol(mac_address, broadcast_ip)
+              -- Send wake-on-LAN packet using system wakeonlan command
+              local cmd = string.format("wakeonlan -i %s %s", broadcast_ip or "192.168.4.255", mac_address)
+              local handle = io.popen(cmd .. " 2>&1")
+              local result = handle:read("*a")
+              handle:close()
+              return result
+          end
+
+          local function check_host_alive(host, port, timeout)
+              -- Check if host:port is reachable using netcat
+              timeout = timeout or 5
+              local cmd = string.format("timeout %d nc -z %s %d", timeout, host, port)
+              local exit_code = os.execute(cmd .. " 2>/dev/null")
+              -- os.execute returns 0 on success, non-zero on failure
+              return exit_code == 0
+          end
+
+          local function log_message(message)
+              ngx.log(ngx.ERR, "[WoL-Proxy] " .. message)
+          end
+
+          -- Main logic
+          local gaming_pc_ip = "{{ gaming_pc_ip }}"
+          local gaming_pc_mac = "{{ gaming_pc_mac }}"
+          local ollama_port = {{ ollama_port }}
+          local wake_timeout = {{ wake_timeout }}
+          local health_check_interval = {{ health_check_interval }}
+
+          -- Check if GamingPC is reachable
+          if not check_host_alive(gaming_pc_ip, ollama_port, 3) then
+              log_message("GamingPC not reachable at " .. gaming_pc_ip .. ":" .. ollama_port .. ", sending WoL packet")
+              
+              -- Send WoL packet
+              local wol_result = send_wol(gaming_pc_mac, "192.168.4.255")
+              log_message("WoL packet sent: " .. wol_result)
+              
+              -- Wait for PC to wake up with periodic checks
+              local max_attempts = wake_timeout / health_check_interval
+              local attempts = 0
+              
+              while attempts < max_attempts do
+                  ngx.sleep(health_check_interval)
+                  attempts = attempts + 1
+                  
+                  if check_host_alive(gaming_pc_ip, ollama_port, 3) then
+                      log_message("GamingPC is now online after " .. (attempts * health_check_interval) .. " seconds")
+                      break
+                  end
+                  
+                  log_message("Waiting for GamingPC to wake up... attempt " .. attempts .. "/" .. max_attempts)
+              end
+              
+              if attempts >= max_attempts then
+                  log_message("Timeout waiting for GamingPC to wake up")
+                  ngx.status = 503
+                  ngx.header.content_type = "application/json"
+                  ngx.say('{"error": "GamingPC failed to wake up within timeout period"}')
+                  ngx.exit(503)
+              end
+          else
+              log_message("GamingPC is already online")
+          end
+        dest: /etc/nginx/lua/wol_check.lua
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart nginx
+      tags:
+        - nginx
+        - lua
+
+    - name: Backup original nginx configuration
+      copy:
+        src: /etc/nginx/nginx.conf
+        dest: "/etc/nginx/nginx.conf.backup.{{ ansible_date_time.epoch }}"
+        remote_src: true
+        backup: true
+      tags:
+        - nginx
+        - backup
+
+    - name: Configure nginx main configuration
+      copy:
+        content: |
+          user {{ nginx_user }};
+          worker_processes {{ nginx_worker_processes }};
+          pid /run/nginx.pid;
+          include /etc/nginx/modules-enabled/*.conf;
+
+          events {
+              worker_connections {{ nginx_worker_connections }};
+              use epoll;
+              multi_accept on;
+          }
+
+          http {
+              ##
+              # Basic Settings
+              ##
+              sendfile on;
+              tcp_nopush on;
+              tcp_nodelay on;
+              keepalive_timeout 65;
+              types_hash_max_size 2048;
+              client_max_body_size 100M;  # For large Ollama model uploads
+
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+
+              ##
+              # Logging Settings
+              ##
+              log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                             '$status $body_bytes_sent "$http_referer" '
+                             '"$http_user_agent" "$http_x_forwarded_for" '
+                             'rt=$request_time uct="$upstream_connect_time" '
+                             'uht="$upstream_header_time" urt="$upstream_response_time"';
+
+              access_log /var/log/nginx/access.log main;
+              error_log /var/log/nginx/error.log;
+
+              ##
+              # Gzip Settings
+              ##
+              gzip on;
+              gzip_vary on;
+              gzip_proxied any;
+              gzip_comp_level 6;
+              gzip_types
+                  text/plain
+                  text/css
+                  text/xml
+                  text/javascript
+                  application/json
+                  application/javascript
+                  application/xml+rss
+                  application/atom+xml
+                  image/svg+xml;
+
+              ##
+              # Upstream configuration for Ollama
+              ##
+              upstream ollama_backend {
+                  server {{ gaming_pc_ip }}:{{ ollama_port }};
+                  keepalive 10;
+              }
+
+              ##
+              # Server configuration
+              ##
+              server {
+                  listen {{ proxy_listen_port }};
+                  server_name _;
+
+                  # Increase timeouts for long-running AI requests
+                  proxy_connect_timeout {{ proxy_timeout }}s;
+                  proxy_send_timeout 300s;
+                  proxy_read_timeout 300s;
+                  send_timeout 300s;
+
+                  # Ollama API proxy
+                  location / {
+                      # Execute wake-on-LAN check before proxying
+                      access_by_lua_file /etc/nginx/lua/wol_check.lua;
+
+                      proxy_pass http://ollama_backend;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                      
+                      # WebSocket support for streaming responses
+                      proxy_http_version 1.1;
+                      proxy_set_header Upgrade $http_upgrade;
+                      proxy_set_header Connection "upgrade";
+                      
+                      # Disable buffering for streaming responses
+                      proxy_buffering off;
+                      proxy_request_buffering off;
+                  }
+
+                  # Health check endpoint
+                  location /health {
+                      access_log off;
+                      return 200 "nginx-ollama-proxy healthy\n";
+                      add_header Content-Type text/plain;
+                  }
+
+                  # Status endpoint
+                  location /proxy-status {
+                      access_log off;
+                      content_by_lua_block {
+                          local gaming_pc_ip = "{{ gaming_pc_ip }}"
+                          local ollama_port = {{ ollama_port }}
+                          
+                          local handle = io.popen("timeout 3 nc -z " .. gaming_pc_ip .. " " .. ollama_port .. " 2>&1")
+                          local result = handle:read("*a")
+                          local is_alive = handle:close()
+                          
+                          ngx.header.content_type = "application/json"
+                          if is_alive then
+                              ngx.say('{"status": "online", "gaming_pc": "' .. gaming_pc_ip .. ':' .. ollama_port .. '", "message": "GamingPC is reachable"}')
+                          else
+                              ngx.say('{"status": "offline", "gaming_pc": "' .. gaming_pc_ip .. ':' .. ollama_port .. '", "message": "GamingPC is not reachable"}')
+                          end
+                      }
+                  }
+              }
+          }
+        dest: /etc/nginx/nginx.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart nginx
+      tags:
+        - nginx
+        - configuration
+
+    - name: Test nginx configuration syntax
+      command: nginx -t
+      register: nginx_test_result
+      changed_when: false
+      failed_when: nginx_test_result.rc != 0
+      tags:
+        - nginx
+        - validation
+
+    - name: Enable and start nginx service
+      systemd:
+        name: nginx
+        enabled: true
+        state: started
+      tags:
+        - nginx
+        - services
+
+    - name: Check if UFW is active
+      command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+      tags:
+        - nginx
+        - firewall
+
+    - name: Allow nginx proxy through firewall
+      ufw:
+        rule: allow
+        port: "{{ proxy_listen_port }}"
+        src: "192.168.4.0/24"
+      when: "'Status: active' in ufw_status.stdout"
+      tags:
+        - nginx
+        - firewall
+
+    - name: Create nginx log rotation configuration
+      copy:
+        content: |
+          /var/log/nginx/*.log {
+              daily
+              missingok
+              rotate 14
+              compress
+              delaycompress
+              notifempty
+              create 0644 www-data adm
+              sharedscripts
+              prerotate
+                  if [ -d /etc/logrotate.d/httpd-prerotate ]; then \
+                      run-parts /etc/logrotate.d/httpd-prerotate; \
+                  fi \
+              endscript
+              postrotate
+                  invoke-rc.d nginx rotate >/dev/null 2>&1
+              endscript
+          }
+        dest: /etc/logrotate.d/nginx-ollama-proxy
+        owner: root
+        group: root
+        mode: '0644'
+      tags:
+        - nginx
+        - logging
+
+  post_tasks:
+    - name: Create nginx proxy configuration summary
+      copy:
+        content: |
+          # HomeLab Nginx Ollama Proxy Configuration Applied
+          # Timestamp: {{ ansible_date_time.iso8601 }}
+          # Playbook: nginx-ollama-proxy.yaml
+          # Host: {{ inventory_hostname }}
+          # 
+          # Proxy Configuration Details:
+          # - Listen Port: {{ proxy_listen_port }}
+          # - GamingPC Target: {{ gaming_pc_ip }}:{{ ollama_port }}
+          # - GamingPC MAC: {{ gaming_pc_mac }}
+          # - Wake Timeout: {{ wake_timeout }} seconds
+          # 
+          # Services Status:
+          # - nginx: enabled and started
+          # - Wake-on-LAN: configured with Lua script
+          # 
+          # Firewall Rules Added:
+          # - Port {{ proxy_listen_port }} (Ollama Proxy)
+          # - Source: 192.168.4.0/24 (local network)
+          # 
+          # Usage Instructions:
+          # 1. Point Open WebUI to: http://{{ ansible_default_ipv4.address }}:{{ proxy_listen_port }}
+          # 2. Check proxy status: http://{{ ansible_default_ipv4.address }}:{{ proxy_listen_port }}/proxy-status
+          # 3. Health check: http://{{ ansible_default_ipv4.address }}:{{ proxy_listen_port }}/health
+          # 
+          # Configuration Files:
+          # - Nginx config: /etc/nginx/nginx.conf
+          # - WoL Lua script: /etc/nginx/lua/wol_check.lua
+          # - Logs: /var/log/nginx/access.log, /var/log/nginx/error.log
+          # 
+          # Troubleshooting:
+          # - Test WoL manually: wakeonlan -i 255.255.255.255 {{ gaming_pc_mac }}
+          # - Check nginx status: sudo systemctl status nginx
+          # - View nginx logs: sudo tail -f /var/log/nginx/error.log
+          # - Test connectivity: nc -z {{ gaming_pc_ip }} {{ ollama_port }}
+        dest: /var/log/homelab-nginx-proxy-config-{{ ansible_date_time.epoch }}.log
+        owner: root
+        group: root
+        mode: '0644'
+      tags: 
+        - nginx
+        - backup
+        - logging
+
+    - name: Display completion summary
+      debug:
+        msg:
+          - "=========================================="
+          - "Nginx Ollama Proxy with WoL Complete!"
+          - "=========================================="
+          - "Successfully configured:"
+          - "  ✓ Nginx reverse proxy on port {{ proxy_listen_port }}"
+          - "  ✓ Wake-on-LAN integration with Lua"
+          - "  ✓ Target: {{ gaming_pc_ip }}:{{ ollama_port }}"
+          - "  ✓ MAC Address: {{ gaming_pc_mac }}"
+          - "  ✓ Firewall rules added"
+          - ""
+          - "Configuration URLs:"
+          - "  • Ollama Proxy: http://{{ ansible_default_ipv4.address }}:{{ proxy_listen_port }}"
+          - "  • Status Check: http://{{ ansible_default_ipv4.address }}:{{ proxy_listen_port }}/proxy-status"
+          - "  • Health Check: http://{{ ansible_default_ipv4.address }}:{{ proxy_listen_port }}/health"
+          - ""
+          - "Next Steps:"
+          - "  1. Update GamingPC IP and MAC in vars section if needed"
+          - "  2. Configure Open WebUI to use: http://{{ ansible_default_ipv4.address }}:{{ proxy_listen_port }}"
+          - "  3. Enable Wake-on-LAN in GamingPC BIOS/network settings"
+          - ""
+          - "Configuration logged to:"
+          - "  /var/log/homelab-nginx-proxy-config-{{ ansible_date_time.epoch }}.log"
+          - "=========================================="
+      tags: always
+
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+      tags:
+        - nginx
+        - handlers
+
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+      tags:
+        - nginx
+        - handlers

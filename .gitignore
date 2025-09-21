@@ -1,0 +1,66 @@
+# Ansible GitIgnore for HomeLab
+# ================================
+
+# Logs and temporary files
+logs/
+*.log
+tmp/
+.tmp/
+*.tmp
+
+# Ansible runtime files
+*.retry
+.ansible/
+ansible.log
+*.pyc
+__pycache__/
+
+# Backup files
+*.backup
+*.backup.*
+*.bak
+*~
+
+# Sensitive files (uncomment if needed)
+# inventory/**/host_vars/*/vault.yml
+# inventory/**/group_vars/*/vault.yml
+# vault_password_file
+# secrets/
+# *.key
+# *.pem
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local development
+.vagrant/
+.env
+.local
+
+# Temporary ansible files
+.ansible_vault_password
+ansible_vault_password
+
+# Collections downloads
+collections/
+
+# Dependencies
+requirements.lock
+galaxy_install_info
+
+# Local testing
+test_output/
+molecule/*/molecule.yml.bak
