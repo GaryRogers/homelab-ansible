@@ -1,0 +1,286 @@
+---
+#===============================================================================
+# GitHub Deployment Playbook
+#===============================================================================
+# Description: Pulls latest changes from GitHub repository and applies updates
+# Author: HomeLab
+# Version: 1.0
+# Usage: ansible-playbook -i inventory/inventory.yaml playbooks/deploy-from-github.yaml
+#===============================================================================
+
+- name: Deploy HomeLab Configuration from GitHub
+  hosts: local
+  become: true
+  gather_facts: true
+  
+  vars:
+    # GitHub repository configuration
+    github_repo: "https://github.com/USERNAME/homelab-ansible.git"  # UPDATE THIS
+    github_branch: "main"
+    deploy_directory: "/opt/ansible-deploy"
+    current_directory: "/opt/ansible"
+    backup_directory: "/opt/ansible-backups"
+    
+    # Deployment options
+    create_backup: true
+    restart_services: false
+    run_full_playbook: true
+    
+  pre_tasks:
+    - name: Display deployment information
+      debug:
+        msg:
+          - "=========================================="
+          - "GitHub Deployment - HomeLab Ansible"
+          - "=========================================="
+          - "Repository: {{ github_repo }}"
+          - "Branch: {{ github_branch }}"
+          - "Deploy Directory: {{ deploy_directory }}"
+          - "Current Directory: {{ current_directory }}"
+          - "Create Backup: {{ create_backup }}"
+          - "Timestamp: {{ ansible_date_time.iso8601 }}"
+          - "=========================================="
+      tags: always
+
+  tasks:
+    - name: Install git if not present
+      package:
+        name: git
+        state: present
+      tags:
+        - deployment
+        - packages
+
+    - name: Create backup directory
+      file:
+        path: "{{ backup_directory }}"
+        state: directory
+        owner: ansible
+        group: ansible
+        mode: '0755'
+      when: create_backup
+      tags:
+        - deployment
+        - backup
+
+    - name: Create backup of current configuration
+      archive:
+        path: "{{ current_directory }}"
+        dest: "{{ backup_directory }}/ansible-backup-{{ ansible_date_time.epoch }}.tar.gz"
+        owner: ansible
+        group: ansible
+        mode: '0644'
+        exclude_path:
+          - "{{ current_directory }}/logs"
+          - "{{ current_directory }}/tmp"
+          - "{{ current_directory }}/.git"
+      when: create_backup
+      tags:
+        - deployment
+        - backup
+
+    - name: Remove old deployment directory if exists
+      file:
+        path: "{{ deploy_directory }}"
+        state: absent
+      tags:
+        - deployment
+        - cleanup
+
+    - name: Clone repository from GitHub
+      git:
+        repo: "{{ github_repo }}"
+        dest: "{{ deploy_directory }}"
+        version: "{{ github_branch }}"
+        force: yes
+        clone: yes
+      tags:
+        - deployment
+        - git
+
+    - name: Verify deployment directory structure
+      stat:
+        path: "{{ deploy_directory }}/{{ item }}"
+      register: directory_check
+      loop:
+        - "playbooks"
+        - "inventory"
+        - "templates"
+        - "ansible.cfg"
+      failed_when: not directory_check.results[0].stat.exists
+      tags:
+        - deployment
+        - validation
+
+    - name: Copy inventory from current setup (preserve local settings)
+      copy:
+        src: "{{ current_directory }}/inventory/"
+        dest: "{{ deploy_directory }}/inventory/"
+        owner: ansible
+        group: ansible
+        mode: preserve
+        backup: yes
+      tags:
+        - deployment
+        - configuration
+
+    - name: Compare ansible.cfg files
+      shell: diff {{ current_directory }}/ansible.cfg {{ deploy_directory }}/ansible.cfg
+      register: ansible_cfg_diff
+      failed_when: false
+      changed_when: false
+      tags:
+        - deployment
+        - validation
+
+    - name: Display ansible.cfg differences
+      debug:
+        msg: 
+          - "Ansible.cfg differences found:"
+          - "{{ ansible_cfg_diff.stdout_lines }}"
+      when: ansible_cfg_diff.rc != 0
+      tags:
+        - deployment
+        - validation
+
+    - name: Update current directory with new changes
+      synchronize:
+        src: "{{ deploy_directory }}/"
+        dest: "{{ current_directory }}/"
+        delete: no
+        recursive: yes
+        links: yes
+        checksum: yes
+        owner: no
+        group: no
+        perms: yes
+      delegate_to: "{{ inventory_hostname }}"
+      tags:
+        - deployment
+        - sync
+
+    - name: Set proper ownership on ansible directory
+      file:
+        path: "{{ current_directory }}"
+        owner: ansible
+        group: ansible
+        recurse: yes
+        mode: 'u+rwX,g+rwX,o-rwx'
+      tags:
+        - deployment
+        - permissions
+
+    - name: Test ansible configuration
+      command: ansible-playbook --syntax-check {{ current_directory }}/playbooks/local.yaml
+      changed_when: false
+      tags:
+        - deployment
+        - validation
+
+    - name: Run full deployment playbook
+      command: >
+        ansible-playbook 
+        -i {{ current_directory }}/inventory/inventory.yaml 
+        {{ current_directory }}/playbooks/local.yaml
+      register: playbook_result
+      when: run_full_playbook
+      tags:
+        - deployment
+        - execute
+
+    - name: Display playbook execution results
+      debug:
+        msg:
+          - "Playbook execution completed:"
+          - "Return code: {{ playbook_result.rc | default('N/A') }}"
+          - "Duration: {{ playbook_result.delta | default('N/A') }}"
+      when: run_full_playbook and playbook_result is defined
+      tags:
+        - deployment
+        - results
+
+    - name: Clean up deployment directory
+      file:
+        path: "{{ deploy_directory }}"
+        state: absent
+      tags:
+        - deployment
+        - cleanup
+
+  post_tasks:
+    - name: Create deployment log
+      copy:
+        content: |
+          # HomeLab GitHub Deployment Log
+          # Timestamp: {{ ansible_date_time.iso8601 }}
+          # Repository: {{ github_repo }}
+          # Branch: {{ github_branch }}
+          # Host: {{ inventory_hostname }}
+          # 
+          # Deployment Status: SUCCESS
+          # Backup Created: {{ create_backup }}
+          {% if create_backup %}
+          # Backup Location: {{ backup_directory }}/ansible-backup-{{ ansible_date_time.epoch }}.tar.gz
+          {% endif %}
+          # 
+          # Files Updated:
+          # - Playbooks synchronized from GitHub
+          # - Templates and configurations updated
+          # - Inventory preserved from local setup
+          # 
+          {% if run_full_playbook and playbook_result is defined %}
+          # Full Playbook Execution: {{ 'SUCCESS' if playbook_result.rc == 0 else 'FAILED' }}
+          {% endif %}
+          # 
+          # Next Steps:
+          # - Review any configuration differences
+          # - Verify services are running correctly
+          # - Check logs for any issues
+        dest: /var/log/homelab-github-deploy-{{ ansible_date_time.epoch }}.log
+        owner: root
+        group: root
+        mode: '0644'
+      tags: 
+        - deployment
+        - logging
+
+    - name: Display deployment completion summary
+      debug:
+        msg:
+          - "=========================================="
+          - "GitHub Deployment Complete!"
+          - "=========================================="
+          - "Successfully deployed from:"
+          - "  Repository: {{ github_repo }}"
+          - "  Branch: {{ github_branch }}"
+          - ""
+          - "Actions performed:"
+          - "  ✓ Configuration backed up"
+          - "  ✓ Latest code pulled from GitHub"
+          - "  ✓ Files synchronized to {{ current_directory }}"
+          - "  ✓ Permissions set correctly"
+          - "  ✓ Configuration validated"
+          - "  {{ '✓ Full playbook executed' if run_full_playbook else '○ Full playbook skipped' }}"
+          - ""
+          - "{{ 'Backup saved to: ' + backup_directory + '/ansible-backup-' + ansible_date_time.epoch + '.tar.gz' if create_backup else 'No backup created' }}"
+          - ""
+          - "Deployment logged to:"
+          - "  /var/log/homelab-github-deploy-{{ ansible_date_time.epoch }}.log"
+          - "=========================================="
+      tags: always
+
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+      when: restart_services
+
+    - name: restart samba
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - smbd
+        - nmbd
+      when: restart_services
