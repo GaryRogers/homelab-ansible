@@ -1,0 +1,532 @@
+---
+#===============================================================================
+# Kubernetes Dashboard Installation and Configuration Playbook
+#===============================================================================
+# Description: Installs and configures Kubernetes Dashboard with admin user
+#              access using Helm and provides secure authentication setup
+# Author: HomeLab
+# Version: 1.0
+# Usage: ansible-playbook -i inventory/inventory.yaml playbooks/k8s-dashboard.yaml
+# Reference: https://kubernetes.io/docs/tasks/access-application-cluster/web-ui-dashboard
+#===============================================================================
+
+- name: Install and Configure Kubernetes Dashboard
+  hosts: local
+  become: true
+  gather_facts: true
+  
+  vars:
+    # Dashboard configuration variables
+    dashboard_namespace: "kubernetes-dashboard"
+    dashboard_release_name: "kubernetes-dashboard"
+    dashboard_repo_name: "kubernetes-dashboard"
+    dashboard_repo_url: "https://kubernetes.github.io/dashboard/"
+    dashboard_chart: "kubernetes-dashboard/kubernetes-dashboard"
+    dashboard_admin_user: "admin-user"
+    k3s_config_file: "/etc/rancher/k3s/k3s.yaml"
+    dashboard_port: 8443
+    current_user: "{{ ansible_user | default(ansible_user_id) }}"
+    
+  pre_tasks:
+    - name: Display dashboard installation information
+      debug:
+        msg:
+          - "=========================================="
+          - "Kubernetes Dashboard Installation"
+          - "=========================================="
+          - "Target Host: {{ inventory_hostname }}"
+          - "Namespace: {{ dashboard_namespace }}"
+          - "Release Name: {{ dashboard_release_name }}"
+          - "Admin User: {{ dashboard_admin_user }}"
+          - "Dashboard Port: {{ dashboard_port }}"
+          - "Current User: {{ current_user }}"
+          - "Timestamp: {{ ansible_date_time.iso8601 }}"
+          - "=========================================="
+      tags: always
+
+    - name: Check if k3s is installed and running
+      stat:
+        path: "{{ k3s_config_file }}"
+      register: k3s_config_stat
+      tags:
+        - dashboard
+        - check
+
+    - name: Verify k3s cluster is accessible
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        kubeconfig: "{{ k3s_config_file }}"
+      register: cluster_nodes
+      when: k3s_config_stat.stat.exists
+      tags:
+        - dashboard
+        - check
+
+    - name: Check if Helm is installed
+      command: helm version --short
+      register: helm_version_check
+      failed_when: false
+      changed_when: false
+      tags:
+        - dashboard
+        - check
+
+    - name: Fail if prerequisites are not met
+      fail:
+        msg: |
+          Prerequisites not met:
+          {% if not k3s_config_stat.stat.exists %}
+          - K3s configuration file not found at {{ k3s_config_file }}
+          {% endif %}
+          {% if helm_version_check.rc != 0 %}
+          - Helm is not installed or not accessible
+          {% endif %}
+          
+          Please ensure:
+          1. K3s is installed and running
+          2. Helm is installed
+          3. Current user has access to k3s config
+      when: not k3s_config_stat.stat.exists or helm_version_check.rc != 0
+      tags:
+        - dashboard
+        - check
+
+  tasks:
+    - name: Add Kubernetes Dashboard Helm repository
+      kubernetes.core.helm_repository:
+        name: "{{ dashboard_repo_name }}"
+        repo_url: "{{ dashboard_repo_url }}"
+      environment:
+        KUBECONFIG: "{{ k3s_config_file }}"
+      tags:
+        - dashboard
+        - helm
+
+    - name: Update Helm repositories
+      kubernetes.core.helm:
+        name: "dummy"
+        chart_ref: "dummy"
+        release_namespace: "dummy"
+        state: absent
+        update_repo_cache: true
+      environment:
+        KUBECONFIG: "{{ k3s_config_file }}"
+      failed_when: false
+      tags:
+        - dashboard
+        - helm
+
+    - name: Create Kubernetes Dashboard namespace
+      kubernetes.core.k8s:
+        name: "{{ dashboard_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+        kubeconfig: "{{ k3s_config_file }}"
+      tags:
+        - dashboard
+        - namespace
+
+    - name: Install Kubernetes Dashboard using Helm
+      kubernetes.core.helm:
+        name: "{{ dashboard_release_name }}"
+        chart_ref: "{{ dashboard_chart }}"
+        release_namespace: "{{ dashboard_namespace }}"
+        create_namespace: true
+        state: present
+        update_repo_cache: true
+        values:
+          app:
+            # Configure Dashboard settings
+            mode: 'dashboard'
+            ingress:
+              enabled: false
+            settings:
+              # Disable metrics scraper for lighter resource usage
+              resourceAutoRefreshTimeInterval: 5
+          metricsScraper:
+            enabled: true
+          # Configure service settings
+          service:
+            type: ClusterIP
+            externalPort: 443
+          # Resource limits
+          resources:
+            limits:
+              cpu: 100m
+              memory: 200Mi
+            requests:
+              cpu: 50m
+              memory: 100Mi
+      environment:
+        KUBECONFIG: "{{ k3s_config_file }}"
+      register: dashboard_install_result
+      tags:
+        - dashboard
+        - helm
+        - install
+
+    - name: Wait for Dashboard deployment to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ dashboard_release_name }}-web"
+        namespace: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+      tags:
+        - dashboard
+        - wait
+
+    - name: Create admin user ServiceAccount
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ k3s_config_file }}"
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ dashboard_admin_user }}"
+            namespace: "{{ dashboard_namespace }}"
+      tags:
+        - dashboard
+        - admin
+        - serviceaccount
+
+    - name: Create admin user ClusterRoleBinding
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ k3s_config_file }}"
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: "{{ dashboard_admin_user }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-admin
+          subjects:
+          - kind: ServiceAccount
+            name: "{{ dashboard_admin_user }}"
+            namespace: "{{ dashboard_namespace }}"
+      tags:
+        - dashboard
+        - admin
+        - rbac
+
+    - name: Create long-lived token Secret for admin user
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ k3s_config_file }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ dashboard_admin_user }}"
+            namespace: "{{ dashboard_namespace }}"
+            annotations:
+              kubernetes.io/service-account.name: "{{ dashboard_admin_user }}"
+          type: kubernetes.io/service-account-token
+      tags:
+        - dashboard
+        - admin
+        - token
+
+    - name: Wait for token secret to be populated
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ dashboard_admin_user }}"
+        namespace: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+        wait: true
+        wait_condition:
+          type: Complete
+        wait_timeout: 60
+      failed_when: false
+      tags:
+        - dashboard
+        - admin
+        - token
+
+    - name: Get admin user token
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ dashboard_admin_user }}"
+        namespace: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+      register: admin_secret
+      tags:
+        - dashboard
+        - admin
+        - token
+
+    - name: Decode admin user token
+      set_fact:
+        admin_token: "{{ admin_secret.resources[0].data.token | b64decode }}"
+      when: admin_secret.resources[0].data.token is defined
+      tags:
+        - dashboard
+        - admin
+        - token
+
+    - name: Generate temporary token if secret token not available
+      command: kubectl -n {{ dashboard_namespace }} create token {{ dashboard_admin_user }} --duration=24h --kubeconfig={{ k3s_config_file }}
+      register: temp_token_result
+      failed_when: false
+      when: admin_token is not defined
+      tags:
+        - dashboard
+        - admin
+        - token
+
+    - name: Set temporary token if needed
+      set_fact:
+        admin_token: "{{ temp_token_result.stdout | trim }}"
+      when: admin_token is not defined and temp_token_result.stdout is defined
+      tags:
+        - dashboard
+        - admin
+        - token
+
+    - name: Get Dashboard service information
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: "{{ dashboard_release_name }}-kong-proxy"
+        namespace: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+      register: dashboard_service
+      tags:
+        - dashboard
+        - service
+
+    - name: Create Avahi service file for Dashboard
+      template:
+        src: bonjour/k8s-dashboard.service.j2
+        dest: /etc/avahi/services/k8s-dashboard.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - restart avahi-daemon
+      tags:
+        - dashboard
+        - avahi
+        - bonjour
+
+    - name: Create Dashboard access script
+      copy:
+        content: |
+          #!/bin/bash
+          # Kubernetes Dashboard Access Script
+          # Generated by Ansible on {{ ansible_date_time.iso8601 }}
+          
+          set -e
+          
+          KUBECONFIG="{{ k3s_config_file }}"
+          NAMESPACE="{{ dashboard_namespace }}"
+          SERVICE="{{ dashboard_release_name }}-kong-proxy"
+          PORT="{{ dashboard_port }}"
+          ADMIN_USER="{{ dashboard_admin_user }}"
+          
+          echo "=========================================="
+          echo "Kubernetes Dashboard Access"
+          echo "=========================================="
+          echo "Dashboard URL: https://localhost:${PORT}"
+          echo "Namespace: ${NAMESPACE}"
+          echo "Service: ${SERVICE}"
+          echo ""
+          
+          # Check if service exists
+          if ! kubectl --kubeconfig="${KUBECONFIG}" -n "${NAMESPACE}" get service "${SERVICE}" >/dev/null 2>&1; then
+              echo "ERROR: Dashboard service not found!"
+              echo "Please ensure the dashboard is installed and running."
+              exit 1
+          fi
+          
+          echo "Generating fresh admin token..."
+          echo "Admin Token (copy this for login):"
+          kubectl --kubeconfig="${KUBECONFIG}" -n "${NAMESPACE}" create token "${ADMIN_USER}" --duration=24h 2>/dev/null || {
+              echo "ERROR: Failed to generate token. Please ensure admin user exists:"
+              echo "kubectl -n ${NAMESPACE} get serviceaccount ${ADMIN_USER}"
+              exit 1
+          }
+          echo ""
+          echo "Starting port-forward to Dashboard..."
+          echo "Access the dashboard at: https://localhost:${PORT}"
+          echo ""
+          echo "Press Ctrl+C to stop the port-forward"
+          echo "=========================================="
+          
+          kubectl --kubeconfig="${KUBECONFIG}" -n "${NAMESPACE}" port-forward "svc/${SERVICE}" "${PORT}:443"
+        dest: /usr/local/bin/k8s-dashboard
+        owner: root
+        group: root
+        mode: '0755'
+      tags:
+        - dashboard
+        - script
+
+    - name: Find kubectl binary location
+      command: which kubectl
+      register: kubectl_path
+      changed_when: false
+      tags:
+        - dashboard
+        - systemd
+
+    - name: Create Dashboard systemd service for persistent access
+      copy:
+        content: |
+          [Unit]
+          Description=Kubernetes Dashboard Port Forward
+          After=k3s.service
+          Wants=k3s.service
+          
+          [Service]
+          Type=exec
+          User={{ current_user }}
+          Group=k3s
+          Environment=KUBECONFIG={{ k3s_config_file }}
+          ExecStart={{ kubectl_path.stdout }} -n {{ dashboard_namespace }} port-forward svc/{{ dashboard_release_name }}-kong-proxy {{ dashboard_port }}:443
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/k8s-dashboard-proxy.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart k8s-dashboard-proxy
+      tags:
+        - dashboard
+        - systemd
+
+    - name: Open firewall port for Dashboard access
+      ufw:
+        rule: allow
+        port: "{{ dashboard_port }}"
+        proto: tcp
+        comment: "Kubernetes Dashboard"
+      tags:
+        - dashboard
+        - firewall
+
+  post_tasks:
+    - name: Create Dashboard configuration log
+      copy:
+        content: |
+          # Kubernetes Dashboard Configuration Applied
+          # Timestamp: {{ ansible_date_time.iso8601 }}
+          # Playbook: k8s-dashboard.yaml
+          # Host: {{ inventory_hostname }}
+          # 
+          # Installation Details:
+          # - Namespace: {{ dashboard_namespace }}
+          # - Release Name: {{ dashboard_release_name }}
+          # - Dashboard Port: {{ dashboard_port }}
+          # - Admin User: {{ dashboard_admin_user }}
+          # - Service Name: {{ dashboard_release_name }}-kong-proxy
+          # 
+          # Access Information:
+          # - Local URL: https://localhost:{{ dashboard_port }}
+          # - Admin Token: {{ admin_token | default('Use: kubectl -n ' + dashboard_namespace + ' create token ' + dashboard_admin_user) }}
+          # 
+          # Access Methods:
+          # 1. Manual Port Forward:
+          #    kubectl -n {{ dashboard_namespace }} port-forward svc/{{ dashboard_release_name }}-kong-proxy {{ dashboard_port }}:443
+          # 
+          # 2. Using convenience script:
+          #    /usr/local/bin/k8s-dashboard
+          # 
+          # 3. Persistent service (auto-start):
+          #    sudo systemctl enable k8s-dashboard-proxy
+          #    sudo systemctl start k8s-dashboard-proxy
+          # 
+          # Security Notes:
+          # - Dashboard is accessible via HTTPS only
+          # - Admin user has cluster-admin privileges
+          # - Token authentication required
+          # - Local access only (port-forward)
+          # 
+          # Troubleshooting:
+          # - Check pod status: kubectl -n {{ dashboard_namespace }} get pods
+          # - Check service: kubectl -n {{ dashboard_namespace }} get svc
+          # - Check logs: kubectl -n {{ dashboard_namespace }} logs -l app.kubernetes.io/name=kubernetes-dashboard
+          # - Generate new token: kubectl -n {{ dashboard_namespace }} create token {{ dashboard_admin_user }}
+        dest: /var/log/homelab-k8s-dashboard-{{ ansible_date_time.epoch }}.log
+        owner: root
+        group: root
+        mode: '0644'
+      tags:
+        - dashboard
+        - logging
+
+    - name: Display completion summary
+      debug:
+        msg:
+          - "=========================================="
+          - "Kubernetes Dashboard Installation Complete!"
+          - "=========================================="
+          - "Successfully configured:"
+          - "  ✓ Kubernetes Dashboard deployed in {{ dashboard_namespace }} namespace"
+          - "  ✓ Admin user '{{ dashboard_admin_user }}' created with cluster-admin privileges"
+          - "  ✓ Authentication token generated"
+          - "  ✓ Port {{ dashboard_port }} opened in firewall"
+          - "  ✓ Avahi service advertisement configured"
+          - "  ✓ Access scripts and systemd service created"
+          - ""
+          - "Access the Dashboard:"
+          - "  1. Run: /usr/local/bin/k8s-dashboard"
+          - "  2. Open: https://localhost:{{ dashboard_port }}"
+          - "  3. Login with Bearer Token:"
+          - "     {{ admin_token | default('kubectl -n ' + dashboard_namespace + ' create token ' + dashboard_admin_user) | truncate(50) }}..."
+          - ""
+          - "Persistent Access:"
+          - "  sudo systemctl enable k8s-dashboard-proxy"
+          - "  sudo systemctl start k8s-dashboard-proxy"
+          - ""
+          - "Configuration logged to:"
+          - "  /var/log/homelab-k8s-dashboard-{{ ansible_date_time.epoch }}.log"
+          - "=========================================="
+      tags: always
+
+  handlers:
+    - name: restart avahi-daemon
+      systemd:
+        name: avahi-daemon
+        state: restarted
+        enabled: true
+      tags:
+        - handlers
+        - avahi
+
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
+      tags:
+        - handlers
+        - systemd
+
+    - name: restart k8s-dashboard-proxy
+      systemd:
+        name: k8s-dashboard-proxy
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      tags:
+        - handlers
+        - systemd

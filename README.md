@@ -34,6 +34,7 @@ ansible/
 │   └── bonjour/           # Service discovery templates
 ├── files/                  # Static files for deployment
 ├── roles/                  # Custom Ansible roles
+├── docs/                   # Detailed documentation
 └── README.md              # This file
 ```
 
@@ -124,6 +125,34 @@ Kubernetes cluster setup:
 Helm package manager setup:
 - Helm v3 installation
 - Common chart repositories
+
+### 🎛️ `k8s-dashboard.yaml`
+Kubernetes Dashboard web interface:
+- Helm-based installation in `kubernetes-dashboard` namespace
+- Admin user with cluster-admin privileges
+- Bearer token authentication
+- Secure HTTPS access via port-forward
+- mDNS service advertisement
+- Systemd service for persistent access
+
+**Usage:**
+```bash
+# Install dashboard (requires k3s and helm)
+ansible-playbook playbooks/k8s-dashboard.yaml
+
+# Access dashboard
+/usr/local/bin/k8s-dashboard
+# Then open https://localhost:8443
+
+# Or start persistent service
+sudo systemctl enable k8s-dashboard-proxy
+sudo systemctl start k8s-dashboard-proxy
+```
+
+**Prerequisites:**
+- K3s cluster running
+- Helm installed
+- kubectl configured
 - Package management tools
 
 ## 🔧 Configuration
@@ -163,6 +192,7 @@ ansible-playbook -i inventory/inventory.yaml playbooks/local.yaml
 ansible-playbook playbooks/smb.yaml
 ansible-playbook playbooks/firewall.yaml
 ansible-playbook playbooks/nginx-ollama-proxy.yaml
+ansible-playbook playbooks/k8s-dashboard.yaml  # Requires k3s + helm
 ```
 
 ### Check Status

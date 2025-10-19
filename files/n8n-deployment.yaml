@@ -1,0 +1,145 @@
+---
+# n8n Workflow Automation Platform Deployment
+# This manifest deploys n8n on k3s with persistent storage and ingress
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: n8n
+  labels:
+    app: n8n
+    managed-by: homelab-ansible
+---
+# Persistent Volume Claim for n8n data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-data
+  namespace: n8n
+  labels:
+    app: n8n
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+# n8n Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: n8n
+  namespace: n8n
+  labels:
+    app: n8n
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: n8n
+  template:
+    metadata:
+      labels:
+        app: n8n
+    spec:
+      containers:
+      - name: n8n
+        image: n8nio/n8n:latest
+        ports:
+        - containerPort: 5678
+        env:
+        - name: N8N_HOST
+          value: "homelab.local"
+        - name: N8N_PORT
+          value: "5678"
+        - name: N8N_PROTOCOL
+          value: "http"
+        - name: N8N_PATH
+          value: "/n8n"
+        - name: WEBHOOK_URL
+          value: "http://homelab.local/n8n"
+        - name: GENERIC_TIMEZONE
+          value: "UTC"
+        - name: N8N_LOG_LEVEL
+          value: "info"
+        - name: N8N_METRICS
+          value: "true"
+        - name: N8N_DIAGNOSTICS_ENABLED
+          value: "false"
+        - name: N8N_SECURE_COOKIE
+          value: "false"
+        volumeMounts:
+        - name: n8n-data
+          mountPath: /home/node/.n8n
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 5678
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 5678
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: n8n-data
+        persistentVolumeClaim:
+          claimName: n8n-data
+---
+# n8n Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: n8n
+  namespace: n8n
+  labels:
+    app: n8n
+spec:
+  selector:
+    app: n8n
+  ports:
+  - name: http
+    port: 80
+    targetPort: 5678
+    protocol: TCP
+  type: ClusterIP
+---
+# n8n StripPrefix Middleware
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: n8n-stripprefix
+  namespace: n8n
+spec:
+  stripPrefix:
+    prefixes:
+      - /n8n
+---
+# n8n IngressRoute (Traefik CRD)
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: n8n-ingress-route
+  namespace: n8n
+  labels:
+    app: n8n
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`homelab.local`) && PathPrefix(`/n8n`)
+      kind: Rule
+      services:
+        - name: n8n
+          port: 80
+      middlewares:
+        - name: n8n-stripprefix

@@ -30,6 +30,10 @@
         port: 11434
         protocol: "tcp"
         description: "Ollama API Proxy with WoL"
+      - name: "n8n"
+        port: 80
+        protocol: "tcp"
+        description: "n8n Workflow Automation Platform"
 
   tasks:
     - name: Update package cache
@@ -102,6 +106,16 @@
       template:
         src: bonjour/ollama-proxy.service.j2
         dest: /etc/avahi/services/ollama-proxy.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart avahi-daemon
+      tags: [services]
+
+    - name: Create n8n service advertisement
+      template:
+        src: bonjour/n8n.service.j2
+        dest: /etc/avahi/services/n8n.service
         owner: root
         group: root
         mode: '0644'

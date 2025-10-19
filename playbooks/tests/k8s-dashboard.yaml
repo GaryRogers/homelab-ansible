@@ -1,0 +1,253 @@
+---
+#===============================================================================
+# Kubernetes Dashboard Test Playbook
+#===============================================================================
+# Description: Tests Kubernetes Dashboard installation and accessibility
+# Author: HomeLab
+# Version: 1.0
+# Usage: ansible-playbook -i inventory/inventory.yaml playbooks/tests/k8s-dashboard.yaml
+#===============================================================================
+
+- name: Test Kubernetes Dashboard Installation
+  hosts: local
+  become: true
+  gather_facts: true
+  
+  vars:
+    dashboard_namespace: "kubernetes-dashboard"
+    dashboard_release_name: "kubernetes-dashboard"
+    dashboard_admin_user: "admin-user"
+    k3s_config_file: "/etc/rancher/k3s/k3s.yaml"
+    dashboard_port: 8443
+    
+  tasks:
+    - name: Display test information
+      debug:
+        msg:
+          - "=========================================="
+          - "Kubernetes Dashboard Test Suite"
+          - "=========================================="
+          - "Target Host: {{ inventory_hostname }}"
+          - "Namespace: {{ dashboard_namespace }}"
+          - "Admin User: {{ dashboard_admin_user }}"
+          - "Dashboard Port: {{ dashboard_port }}"
+          - "Timestamp: {{ ansible_date_time.iso8601 }}"
+          - "=========================================="
+      tags: always
+
+    - name: Check k3s configuration file exists
+      stat:
+        path: "{{ k3s_config_file }}"
+      register: k3s_config_stat
+      tags:
+        - test
+        - k3s
+
+    - name: Test k3s cluster accessibility
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        kubeconfig: "{{ k3s_config_file }}"
+      register: cluster_nodes
+      when: k3s_config_stat.stat.exists
+      tags:
+        - test
+        - k3s
+
+    - name: Check Helm installation
+      command: helm version --short
+      register: helm_version
+      failed_when: false
+      changed_when: false
+      tags:
+        - test
+        - helm
+
+    - name: Check Dashboard namespace exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+      register: dashboard_namespace_info
+      when: k3s_config_stat.stat.exists
+      tags:
+        - test
+        - dashboard
+
+    - name: Check Dashboard deployment status
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ dashboard_release_name }}-web"
+        namespace: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+      register: dashboard_deployment
+      when: k3s_config_stat.stat.exists
+      tags:
+        - test
+        - dashboard
+
+    - name: Check Dashboard service status
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: "{{ dashboard_release_name }}-kong-proxy"
+        namespace: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+      register: dashboard_service
+      when: k3s_config_stat.stat.exists
+      tags:
+        - test
+        - dashboard
+
+    - name: Check admin user ServiceAccount
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ServiceAccount
+        name: "{{ dashboard_admin_user }}"
+        namespace: "{{ dashboard_namespace }}"
+        kubeconfig: "{{ k3s_config_file }}"
+      register: admin_serviceaccount
+      when: k3s_config_stat.stat.exists
+      tags:
+        - test
+        - dashboard
+        - admin
+
+    - name: Check admin user ClusterRoleBinding
+      kubernetes.core.k8s_info:
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        name: "{{ dashboard_admin_user }}"
+        kubeconfig: "{{ k3s_config_file }}"
+      register: admin_clusterrolebinding
+      when: k3s_config_stat.stat.exists
+      tags:
+        - test
+        - dashboard
+        - admin
+
+    - name: Check access script exists
+      stat:
+        path: /usr/local/bin/k8s-dashboard
+      register: dashboard_script
+      tags:
+        - test
+        - script
+
+    - name: Check systemd service file exists
+      stat:
+        path: /etc/systemd/system/k8s-dashboard-proxy.service
+      register: dashboard_systemd
+      tags:
+        - test
+        - systemd
+
+    - name: Check Avahi service file exists
+      stat:
+        path: /etc/avahi/services/k8s-dashboard.service
+      register: dashboard_avahi
+      tags:
+        - test
+        - avahi
+
+    - name: Test firewall rule for Dashboard port
+      command: ufw status numbered
+      register: ufw_status
+      changed_when: false
+      tags:
+        - test
+        - firewall
+
+    - name: Generate test token for admin user
+      command: kubectl -n {{ dashboard_namespace }} create token {{ dashboard_admin_user }} --duration=300s --kubeconfig={{ k3s_config_file }}
+      register: test_token
+      failed_when: false
+      when: k3s_config_stat.stat.exists and admin_serviceaccount.resources | length > 0
+      tags:
+        - test
+        - token
+
+    - name: Display comprehensive test results
+      debug:
+        msg:
+          - "=========================================="
+          - "Kubernetes Dashboard Test Results"
+          - "=========================================="
+          - "Prerequisites:"
+          - "  📝 K3s Config File: {{ '✅ EXISTS' if k3s_config_stat.stat.exists else '❌ MISSING' }}"
+          - "  ☸️  K3s Cluster: {{ '✅ ACCESSIBLE (' + (cluster_nodes.resources | length | string) + ' nodes)' if cluster_nodes is defined and cluster_nodes.resources else '❌ NOT ACCESSIBLE' }}"
+          - "  📦 Helm: {{ '✅ INSTALLED (' + helm_version.stdout + ')' if helm_version.rc == 0 else '❌ NOT INSTALLED' }}"
+          - ""
+          - "Dashboard Components:"
+          - "  🏠 Namespace: {{ '✅ EXISTS' if dashboard_namespace_info is defined and dashboard_namespace_info.resources else '❌ MISSING' }}"
+          - "  🚢 Deployment: {{ '✅ READY (' + (dashboard_deployment.resources[0].status.readyReplicas | default(0) | string) + '/' + (dashboard_deployment.resources[0].status.replicas | default(0) | string) + ')' if dashboard_deployment is defined and dashboard_deployment.resources else '❌ NOT FOUND' }}"
+          - "  🌐 Service: {{ '✅ ACTIVE (ClusterIP: ' + dashboard_service.resources[0].spec.clusterIP + ')' if dashboard_service is defined and dashboard_service.resources else '❌ NOT FOUND' }}"
+          - ""
+          - "Access Control:"
+          - "  👤 ServiceAccount: {{ '✅ EXISTS' if admin_serviceaccount is defined and admin_serviceaccount.resources else '❌ MISSING' }}"
+          - "  🔐 ClusterRoleBinding: {{ '✅ CONFIGURED' if admin_clusterrolebinding is defined and admin_clusterrolebinding.resources else '❌ MISSING' }}"
+          - "  🎫 Test Token: {{ '✅ GENERATED' if test_token is defined and test_token.rc == 0 else '❌ FAILED' }}"
+          - ""
+          - "Access Methods:"
+          - "  📜 Access Script: {{ '✅ INSTALLED' if dashboard_script.stat.exists else '❌ MISSING' }} (/usr/local/bin/k8s-dashboard)"
+          - "  🔄 Systemd Service: {{ '✅ CONFIGURED' if dashboard_systemd.stat.exists else '❌ MISSING' }}"
+          - "  📡 mDNS Advertisement: {{ '✅ CONFIGURED' if dashboard_avahi.stat.exists else '❌ MISSING' }}"
+          - "  🔥 Firewall Rule: {{ '✅ PORT ' + dashboard_port|string + ' ALLOWED' if dashboard_port|string in ufw_status.stdout else '❌ PORT NOT OPEN' }}"
+          - ""
+          - "Dashboard URL: https://localhost:{{ dashboard_port }}"
+          - "Access Token: {{ test_token.stdout[:50] + '...' if test_token is defined and test_token.stdout else 'Run: kubectl -n ' + dashboard_namespace + ' create token ' + dashboard_admin_user }}"
+          - "=========================================="
+      tags: always
+
+    - name: Display usage instructions
+      debug:
+        msg:
+          - "📚 Usage Instructions:"
+          - ""
+          - "1. Start Dashboard Access:"
+          - "   /usr/local/bin/k8s-dashboard"
+          - ""
+          - "2. Alternative - Systemd Service:"
+          - "   sudo systemctl start k8s-dashboard-proxy"
+          - ""
+          - "3. Access Dashboard:"
+          - "   Open: https://localhost:{{ dashboard_port }}"
+          - "   Login with Bearer Token (copy from above)"
+          - ""
+          - "4. Generate New Token:"
+          - "   kubectl -n {{ dashboard_namespace }} create token {{ dashboard_admin_user }}"
+          - ""
+          - "5. Troubleshooting:"
+          - "   kubectl -n {{ dashboard_namespace }} get pods"
+          - "   kubectl -n {{ dashboard_namespace }} logs -l app.kubernetes.io/name=kubernetes-dashboard"
+      when: k3s_config_stat.stat.exists
+      tags: always
+
+    - name: Fail if critical components are missing
+      fail:
+        msg: |
+          Critical Dashboard components are missing:
+          {% if not k3s_config_stat.stat.exists %}
+          - K3s configuration file missing
+          {% endif %}
+          {% if helm_version.rc != 0 %}
+          - Helm not installed
+          {% endif %}
+          {% if not (dashboard_namespace_info is defined and dashboard_namespace_info.resources) %}
+          - Dashboard namespace not found
+          {% endif %}
+          {% if not (dashboard_deployment is defined and dashboard_deployment.resources) %}
+          - Dashboard deployment not found
+          {% endif %}
+          
+          Please run: ansible-playbook playbooks/k8s-dashboard.yaml
+      when: >
+        not k3s_config_stat.stat.exists or
+        helm_version.rc != 0 or
+        not (dashboard_namespace_info is defined and dashboard_namespace_info.resources) or
+        not (dashboard_deployment is defined and dashboard_deployment.resources)
+      tags:
+        - test
+        - validation
